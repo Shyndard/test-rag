@@ -24,7 +24,7 @@ def build_prompt(question: str, contexts: list[str]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ask questions over an indexed markdown folder (RAG) using Ollama.")
     parser.add_argument("question", help="Your question")
-    parser.add_argument("--db", default="rag.sqlite", help="SQLite DB path")
+    parser.add_argument("--db", default="rag", help="FAISS index base path")
     parser.add_argument("--base-url", default=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
     parser.add_argument(
         "--preset",

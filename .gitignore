@@ -6,3 +6,4 @@ venv/
 *.sqlite
 *.db
 .DS_Store
+rag.faiss

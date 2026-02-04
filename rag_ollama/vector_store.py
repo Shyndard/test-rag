@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import sqlite3
+import json
+import os
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+import faiss
 import numpy as np
 
 
@@ -19,52 +21,54 @@ class StoredChunk:
 class VectorStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._init_db()
+        self.index_path = f"{db_path}.faiss"
+        self.meta_path = f"{db_path}.json"
+        self._load_or_init()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    def _load_or_init(self) -> None:
+        if os.path.exists(self.index_path) and os.path.exists(self.meta_path):
+            self.index = faiss.read_index(self.index_path)
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                self.metadata = json.load(f)
+        else:
+            self.index = None
+            self.metadata = []
 
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS chunks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source TEXT NOT NULL,
-                    chunk_index INTEGER NOT NULL,
-                    content TEXT NOT NULL,
-                    embedding BLOB NOT NULL,
-                    embedding_dim INTEGER NOT NULL
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)")
+    def _save(self) -> None:
+        if self.index is not None:
+            faiss.write_index(self.index, self.index_path)
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            json.dump(self.metadata, f, ensure_ascii=False)
 
     def clear(self) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM chunks")
+        self.index = None
+        self.metadata = []
+        self._save()
 
     def add(self, *, source: str, chunk_index: int, content: str, embedding: np.ndarray) -> None:
         if embedding.dtype != np.float32:
             embedding = embedding.astype(np.float32)
-        blob = embedding.tobytes()
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO chunks(source, chunk_index, content, embedding, embedding_dim) VALUES (?, ?, ?, ?, ?)",
-                (source, chunk_index, content, blob, int(embedding.shape[0])),
-            )
+        if self.index is None:
+            dim = embedding.shape[0]
+            self.index = faiss.IndexFlatIP(dim)
+        # Normalize for cosine similarity
+        norm = np.linalg.norm(embedding) + 1e-12
+        embedding /= norm
+        self.index.add(embedding.reshape(1, -1))
+        chunk_id = len(self.metadata)
+        self.metadata.append({
+            "id": chunk_id,
+            "source": source,
+            "chunk_index": chunk_index,
+            "content": content,
+        })
+        # No _save here; call _save() explicitly at the end of ingestion
 
     def count(self) -> int:
-        with self._connect() as conn:
-            (n,) = conn.execute("SELECT COUNT(1) FROM chunks").fetchone()
-        return int(n)
+        return self.index.ntotal if self.index is not None else 0
 
     def sources(self) -> list[str]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT DISTINCT source FROM chunks ORDER BY source").fetchall()
-        return [r[0] for r in rows]
+        return sorted(set(meta["source"] for meta in self.metadata))
 
     def search(
         self,
@@ -73,57 +77,41 @@ class VectorStore:
         top_k: int = 5,
         source_filter: Optional[Iterable[str]] = None,
     ) -> list[StoredChunk]:
+        if self.index is None or self.index.ntotal == 0:
+            return []
         if query_embedding.dtype != np.float32:
             query_embedding = query_embedding.astype(np.float32)
+        # Normalize query
+        norm = np.linalg.norm(query_embedding) + 1e-12
+        query_embedding /= norm
+        query = query_embedding.reshape(1, -1)
 
-        where = ""
-        params: list[object] = []
-        if source_filter:
-            srcs = list(source_filter)
-            if srcs:
-                placeholders = ",".join(["?"] * len(srcs))
-                where = f"WHERE source IN ({placeholders})"
-                params.extend(srcs)
+        # Search index
+        scores, indices = self.index.search(query, min(top_k * 2, self.index.ntotal))  # Search more for filtering
+        scores = scores[0]
+        indices = indices[0]
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT id, source, chunk_index, content, embedding, embedding_dim FROM chunks {where}",
-                params,
-            ).fetchall()
+        # Filter by source if needed
+        candidates = []
+        for i, idx in enumerate(indices):
+            if idx == -1:
+                continue
+            meta = self.metadata[idx]
+            if source_filter and meta["source"] not in source_filter:
+                continue
+            candidates.append((meta, scores[i]))
 
-        if not rows:
-            return []
-
-        mat: list[np.ndarray] = []
-        meta: list[tuple[int, str, int, str]] = []
-        for chunk_id, source, chunk_index, content, emb_blob, emb_dim in rows:
-            vec = np.frombuffer(emb_blob, dtype=np.float32, count=int(emb_dim))
-            mat.append(vec)
-            meta.append((int(chunk_id), str(source), int(chunk_index), str(content)))
-
-        A = np.vstack(mat)
-        q = query_embedding.reshape(1, -1)
-
-        # cosine similarity
-        A_norm = np.linalg.norm(A, axis=1, keepdims=True) + 1e-12
-        q_norm = np.linalg.norm(q, axis=1, keepdims=True) + 1e-12
-        sims = (A @ q.T) / (A_norm * q_norm.T)
-        sims = sims.reshape(-1)
-
-        k = min(top_k, sims.shape[0])
-        idxs = np.argpartition(-sims, kth=k - 1)[:k]
-        idxs = idxs[np.argsort(-sims[idxs])]
-
-        out: list[StoredChunk] = []
-        for i in idxs:
-            chunk_id, source, chunk_index, content = meta[int(i)]
+        # Sort by score descending and take top_k
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        out = []
+        for meta, score in candidates[:top_k]:
             out.append(
                 StoredChunk(
-                    id=chunk_id,
-                    source=source,
-                    chunk_index=chunk_index,
-                    content=content,
-                    score=float(sims[int(i)]),
+                    id=meta["id"],
+                    source=meta["source"],
+                    chunk_index=meta["chunk_index"],
+                    content=meta["content"],
+                    score=float(score),
                 )
             )
         return out
